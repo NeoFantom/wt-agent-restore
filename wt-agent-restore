@@ -1,0 +1,997 @@
+#!/usr/bin/env python3
+"""wt-agent-restore — reboot Windows without losing your Claude Code / Codex tabs.
+
+Snapshot every live Claude Code / Codex session running in WSL inside Windows Terminal
+(plus tmux-hosted ones), arm a one-shot logon hook, reboot, and get the same window back:
+same tabs, same order, same tab titles, every agent resumed in its own directory, and
+interrupted agents told what happened so they can pick up where they left off.
+
+Commands:
+  snapshot        record sessions + tab layout and print the restore plan
+  preview         open a throwaway WT window showing what each tab would run (nothing resumes)
+  arm             snapshot + install the one-shot restore hook (no reboot)
+  disarm          remove the hook
+  reboot          [wait for an installer] -> arm -> stop agents gracefully -> restart Windows
+  verify          after the reboot: check every recorded session is running again
+  status          show hook state and the last snapshot
+
+Linux side: Python 3.9+ stdlib only. Windows side: PowerShell 5.1 + Windows Terminal.
+https://github.com/NeoFantom/wt-agent-restore   MIT License
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = '0.1.0'
+HOME = os.path.expanduser('~')
+STATE = os.path.join(os.environ.get('XDG_STATE_HOME', os.path.join(HOME, '.local', 'state')), 'wt-agent-restore')
+CONFIG = os.path.join(os.environ.get('XDG_CONFIG_HOME', os.path.join(HOME, '.config')), 'wt-agent-restore', 'config.json')
+HOOK_NAME = 'wt-agent-restore.cmd'
+
+DEFAULTS = {
+    # Sent to sessions that were mid-task when they were stopped. Empty string disables.
+    'continue_prompt': ('[wt-agent-restore] Windows was just rebooted and this session was stopped in the middle '
+                        'of its work (background shells, subagents and child jobs were killed too). '
+                        'Check how far you got and whether any output is incomplete, then continue the original task.'),
+    # Sent to the session that ran `wt-agent-restore reboot` (if it is one of the agents). Empty disables.
+    'self_prompt': ('[wt-agent-restore] The reboot is done. Run `wt-agent-restore verify`, check the result '
+                    '(every tab, its title, every session resumed, interrupted ones continued), '
+                    'and report back to the user.'),
+    # A session counts as busy if its transcript was written within this many seconds.
+    'busy_window_seconds': 180,
+    # Before resuming, wait until these URLs answer (through the session's own proxy env).
+    'network_check': {'claude': 'https://api.anthropic.com', 'codex': 'https://chatgpt.com'},
+    'network_wait_seconds': 180,
+    # If the agent exits within this many seconds of starting, retry (boot-time network races).
+    'retry_if_exits_within': 30,
+    'retries': 3,
+    # Tab titles: "auto" pins titles that look hand-set, "always" pins every non-default title, "never".
+    'titles': 'auto',
+    # Windows Terminal profile used for restored tabs. null = the profile named after the WSL distro.
+    'profile': None,
+    # Rules that override the relaunch command. First match wins. See config.example.json.
+    'rules': [],
+}
+
+# Environment variables replayed into the relaunched agent (names, regex). Secrets are never written.
+ENV_KEEP = re.compile(r'^(CLAUDE_CONFIG_DIR|CODEX_HOME|TZ|https?_proxy|HTTPS?_PROXY|all_proxy|ALL_PROXY|no_proxy|NO_PROXY|'
+                      r'ANTHROPIC_BASE_URL|ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_\w+_MODEL|CLAUDE_CODE_(EXPERIMENTAL|USE|MAX|DISABLE|ENABLE)_\w+|OPENAI_BASE_URL)$')
+ENV_SECRET = re.compile(r'(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)', re.I)
+# Set by the agents themselves for their children; never replay.
+ENV_INTERNAL = re.compile(r'^CLAUDE_CODE_(CHILD_SESSION|ENTRYPOINT|EXECPATH|SSE_PORT|SESSION_ID|IDE\w*|SHELL\w*)$|^CLAUDECODE$')
+ENV_FOR = {'claude': re.compile(r'^(CLAUDE|ANTHROPIC)_'), 'codex': re.compile(r'^(CODEX|OPENAI)_')}
+_BASELINE = None
+
+
+def baseline_env():
+    """Environment of a fresh interactive shell: only variables that differ from it were added by a wrapper."""
+    global _BASELINE
+    if _BASELINE is None:
+        try:
+            clean = {k: os.environ[k] for k in ('HOME', 'USER', 'LOGNAME', 'LANG', 'WSL_DISTRO_NAME', 'WSL_INTEROP',
+                                                'WSLENV', 'DISPLAY', 'WAYLAND_DISPLAY') if k in os.environ}
+            clean.update(SHELL=user_shell(), TERM='xterm-256color', PATH='/usr/local/bin:/usr/bin:/bin')
+            r = subprocess.run([user_shell(), '-lic', 'env -0'], capture_output=True, timeout=30,
+                               stdin=subprocess.DEVNULL, env=clean, cwd=HOME)
+            _BASELINE = dict(x.decode(errors='replace').split('=', 1) for x in r.stdout.split(b'\0') if b'=' in x)
+        except (OSError, subprocess.TimeoutExpired):
+            _BASELINE = {}
+    return _BASELINE
+
+
+def replay_env(env, kind):
+    base = baseline_env()
+    other = ENV_FOR['codex' if kind == 'claude' else 'claude']
+    return {k: v for k, v in env.items()
+            if ENV_KEEP.match(k) and not ENV_SECRET.search(k) and not ENV_INTERNAL.match(k)
+            and not other.match(k) and base.get(k) != v}
+
+CLAUDE_VALUE_FLAGS = {
+    '--settings', '--permission-mode', '--model', '--fallback-model', '--add-dir', '--mcp-config', '--agent', '--agents',
+    '--append-system-prompt', '--system-prompt', '--system-prompt-file', '--append-system-prompt-file',
+    '--allowedTools', '--allowed-tools', '--disallowedTools', '--disallowed-tools', '--tools', '--plugin-dir',
+    '--setting-sources', '--betas', '--output-format', '--input-format', '--permission-prompt-tool', '--max-turns',
+    '--effort', '--name', '--worktree', '-w', '--debug-file', '--remote-control-session-name-prefix',
+}
+CLAUDE_DROP_FLAGS = {'-c', '--continue', '-p', '--print', '--fork-session'}
+CLAUDE_DROP_VALUE_FLAGS = {'-r', '--resume', '--session-id', '--from-pr'}
+CODEX_VALUE_FLAGS = {'-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox', '-a', '--ask-for-approval',
+                     '-C', '--cd', '-i', '--image', '--enable', '--disable', '--add-dir', '--local-provider'}
+CODEX_SUBCOMMANDS = {'resume', 'fork', 'exec', 'e', 'review', 'login', 'logout', 'mcp', 'mcp-server', 'app-server',
+                     'completion', 'sandbox', 'debug', 'apply', 'a', 'cloud', 'features', 'help'}
+
+# ----------------------------------------------------------------------------- Windows side helpers
+
+UIA_PS1 = r'''param([string]$Out, [switch]$ReadText)
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+$A=[System.Windows.Automation.AutomationElement]; $TS=[System.Windows.Automation.TreeScope]
+$CT=[System.Windows.Automation.ControlType]
+function Cond($p,$v){ New-Object System.Windows.Automation.PropertyCondition($p,$v) }
+$wins=$A::RootElement.FindAll($TS::Children,(Cond $A::ClassNameProperty 'CASCADIA_HOSTING_WINDOW_CLASS'))
+$res=@(); $wi=0
+foreach($w in $wins){
+  $state='Normal'; try { $state=[string]$w.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Current.WindowVisualState } catch {}
+  $r=$w.Current.BoundingRectangle
+  $tabs=$w.FindAll($TS::Descendants,(Cond $A::ControlTypeProperty $CT::TabItem))
+  $sel=-1; $j=0
+  foreach($t in $tabs){ try { if($t.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Current.IsSelected){$sel=$j} } catch {}; $j++ }
+  $j=0
+  foreach($t in $tabs){
+    $text=''; $panes=0
+    if($ReadText){
+      try { $t.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select() } catch {}
+      Start-Sleep -Milliseconds 600
+      $terms=$w.FindAll($TS::Descendants,(Cond $A::ClassNameProperty 'TermControl')); $panes=$terms.Count
+      $parts=@(); foreach($tc in $terms){ try { $tp=$tc.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern); $parts+=(($tp.GetVisibleRanges() | % { $_.GetText(-1) }) -join "`n") } catch {} }
+      $text=$parts -join "`n"
+    }
+    $res+=[pscustomobject]@{window=$wi;index=$j;title=$t.Current.Name;selected=($j -eq $sel);panes=$panes;text=$text;
+                            state=$state;x=[int]$r.X;y=[int]$r.Y;w=[int]$r.Width;h=[int]$r.Height}
+    $j++
+  }
+  if($ReadText -and $sel -ge 0){ try { $tabs[$sel].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select() } catch {} }
+  $wi++
+}
+ConvertTo-Json -InputObject @($res) -Depth 4 | Out-File -Encoding utf8 $Out
+'''
+
+
+def run(cmd, **kw):
+    kw.setdefault('capture_output', True)
+    kw.setdefault('text', True)
+    try:
+        return subprocess.run(cmd, **kw)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, '', f'{cmd[0]}: not found')
+
+
+def win(cmd):
+    """Run a Windows executable from a Windows cwd (avoids the UNC-path warning)."""
+    return run(cmd, cwd='/mnt/c')
+
+
+def winpath(p):
+    return run(['wslpath', '-w', p]).stdout.strip()
+
+
+def winenv(name):
+    out = win(['cmd.exe', '/d', '/c', f'echo %{name}%']).stdout.strip()
+    if not out or '%' in out:
+        die(f'cannot read Windows %{name}% (is this WSL with Windows interop enabled?)')
+    return run(['wslpath', '-u', out]).stdout.strip()
+
+
+def powershell_file(path, *args):
+    return win(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', winpath(path), *args])
+
+
+def windows_dir():
+    d = os.path.join(winenv('USERPROFILE'), '.wt-agent-restore')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def startup_dir():
+    return os.path.join(winenv('APPDATA'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+
+
+def die(msg, code=1):
+    print(f'wt-agent-restore: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    if os.path.exists(CONFIG):
+        try:
+            user = json.load(open(CONFIG, encoding='utf-8'))
+        except ValueError as e:
+            die(f'{CONFIG}: {e}')
+        for k, v in user.items():
+            if k.startswith('_'):
+                continue
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    return cfg
+
+# ----------------------------------------------------------------------------- process discovery
+
+
+def read(path, mode='r'):
+    try:
+        with open(path, mode) as f:
+            return f.read()
+    except OSError:
+        return b'' if 'b' in mode else ''
+
+
+def environ(pid):
+    raw = read(f'/proc/{pid}/environ', 'rb').split(b'\0')
+    return dict(x.decode(errors='replace').split('=', 1) for x in raw if b'=' in x)
+
+
+def stat_fields(pid):
+    s = read(f'/proc/{pid}/stat')
+    return s.rsplit(')', 1)[1].split() if s else []
+
+
+def ppid(pid):
+    f = stat_fields(pid)
+    return int(f[1]) if f else 0
+
+
+def ancestors(pid):
+    out = []
+    while pid > 1:
+        pid = ppid(pid)
+        if pid:
+            out.append(pid)
+    return out
+
+
+def descendants(pid):
+    kids = {}
+    for d in os.listdir('/proc'):
+        if d.isdigit():
+            kids.setdefault(ppid(int(d)), []).append(int(d))
+    out, stack = [], [pid]
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def tab_order_key(pid):
+    """Each wsl.exe connection (= one WT tab/pane) gets its own /init SessionLeader; its start tick orders tabs."""
+    for a in ancestors(pid):
+        if read(f'/proc/{a}/comm').strip() == 'SessionLeader':
+            f = stat_fields(a)
+            return int(f[19]) if f else 0
+    return 0
+
+
+def json_strings(line):
+    """All string values inside one JSONL record, joined (so screen text can be matched without escapes)."""
+    try:
+        o = json.loads(line)
+    except ValueError:
+        return ''
+    out = []
+
+    def walk(x):
+        if isinstance(x, str):
+            out.append(x)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(o)
+    return '\n'.join(out)
+
+
+def tail_text(path, nbytes=600_000):
+    if not path or not os.path.exists(path):
+        return ''
+    with open(path, 'rb') as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - nbytes))
+        raw = f.read().decode(errors='replace')
+    return '\n'.join(json_strings(l) for l in raw.splitlines()[1:] if l.startswith('{'))
+
+
+def codex_rollout(pid, cwd):
+    home = environ(pid).get('CODEX_HOME') or os.path.join(HOME, '.codex')
+    opened = []
+    for fd in os.listdir(f'/proc/{pid}/fd'):
+        try:
+            t = os.readlink(f'/proc/{pid}/fd/{fd}')
+        except OSError:
+            continue
+        if '/sessions/' in t and t.endswith('.jsonl'):
+            opened.append(t)
+    main = None
+    for t in opened:
+        meta = json_meta(t)
+        if meta.get('source') == 'cli':
+            main = (meta.get('id'), t)
+    if not main:  # file not held open: newest CLI rollout in this cwd
+        files = sorted(glob.glob(os.path.join(home, 'sessions', '*', '*', '*', 'rollout-*.jsonl')), key=os.path.getmtime, reverse=True)
+        for t in files[:200]:
+            meta = json_meta(t)
+            if meta.get('source') == 'cli' and meta.get('cwd') == cwd:
+                main = (meta.get('id'), t)
+                break
+    return main, opened
+
+
+def json_meta(path):
+    try:
+        with open(path) as f:
+            return json.loads(f.readline()).get('payload', {})
+    except (OSError, ValueError):
+        return {}
+
+
+def strip_claude_args(argv):
+    out, i = [], 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '--':
+            break
+        name = a.split('=', 1)[0]
+        if name in CLAUDE_DROP_FLAGS:
+            i += 1
+            continue
+        if name in CLAUDE_DROP_VALUE_FLAGS:
+            i += 1 if '=' in a else (2 if i + 1 < len(argv) and not argv[i + 1].startswith('-') else 1)
+            continue
+        if a.startswith('-'):
+            out.append(a)
+            if name in CLAUDE_VALUE_FLAGS and '=' not in a and i + 1 < len(argv):
+                out.append(argv[i + 1])
+                i += 1
+        # bare positional = the initial prompt: dropped
+        i += 1
+    return out
+
+
+def strip_codex_args(argv):
+    out, i = [], 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '--':
+            break
+        if not a.startswith('-'):
+            if a in CODEX_SUBCOMMANDS:
+                i += 1
+                continue
+            i += 1  # positional: prompt or session id
+            continue
+        out.append(a)
+        if a.split('=', 1)[0] in CODEX_VALUE_FLAGS and '=' not in a and i + 1 < len(argv):
+            out.append(argv[i + 1])
+            i += 1
+        i += 1
+    return out
+
+
+def find_sessions(cfg):
+    tmux_panes = {}
+    for sock in set(environ(p).get('TMUX', '').split(',')[0] for p in map(int, filter(str.isdigit, os.listdir('/proc')))) - {''}:
+        r = run(['tmux', '-S', sock, 'list-panes', '-a', '-F', '#{pane_pid}\t#{session_name}\t#{window_width}\t#{window_height}'])
+        for line in r.stdout.splitlines():
+            p, name, w, h = line.split('\t')
+            tmux_panes[int(p)] = dict(socket=sock, name=name, width=int(w), height=int(h))
+    out = []
+    for d in os.listdir('/proc'):
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        argv = [a.decode(errors='replace') for a in read(f'/proc/{pid}/cmdline', 'rb').split(b'\0') if a]
+        if not argv:
+            continue
+        comm = read(f'/proc/{pid}/comm').strip()
+        base = os.path.basename(argv[0])
+        rec = None
+        if comm == 'claude' or base == 'claude':
+            env = environ(pid)
+            cdir = env.get('CLAUDE_CONFIG_DIR') or os.path.join(HOME, '.claude')
+            meta = {}
+            try:
+                meta = json.load(open(os.path.join(cdir, 'sessions', f'{pid}.json')))
+            except (OSError, ValueError):
+                continue
+            if meta.get('kind', 'interactive') != 'interactive' or {'-p', '--print'} & set(argv):
+                continue
+            sid = meta['sessionId']
+            tr = next(iter(glob.glob(os.path.join(cdir, 'projects', '*', f'{sid}.jsonl'))), None)
+            rec = dict(kind='claude', session_id=sid, cwd=meta.get('cwd') or os.readlink(f'/proc/{pid}/cwd'),
+                       transcript=tr, argv0='claude', args=strip_claude_args(argv))
+        elif base == 'codex' and os.path.basename(os.path.realpath(f'/proc/{pid}/exe')) == 'codex':
+            if set(argv) & {'exec', 'e', 'app-server', 'mcp-server', 'review'}:
+                continue
+            env = environ(pid)
+            cwd = os.readlink(f'/proc/{pid}/cwd')
+            main, opened = codex_rollout(pid, cwd)
+            if not main:
+                print(f'warning: codex pid {pid}: cannot find its session id, skipped', file=sys.stderr)
+                continue
+            argv0 = 'codex' if shutil.which('codex') else argv[0]
+            rec = dict(kind='codex', session_id=main[0], cwd=cwd, transcript=main[1], argv0=argv0,
+                       args=strip_codex_args(argv), extra_files=opened)
+        if not rec:
+            continue
+        rec['pid'] = pid
+        rec['env'] = replay_env(env, rec['kind'])
+        rec['command'] = relaunch_command(rec, cfg)
+        anc = ancestors(pid)
+        tm = next((tmux_panes[a] for a in [pid] + anc if a in tmux_panes), None)
+        if tm:
+            rec['container'], rec['tmux'] = 'tmux', tm
+        elif env.get('WT_SESSION'):
+            rec['container'], rec['wt_session'], rec['order'] = 'wt', env['WT_SESSION'], tab_order_key(pid)
+        else:
+            continue  # not in a terminal we can rebuild (VS Code, ssh, ...)
+        rec['busy'], rec['busy_why'] = busy_state(rec, cfg)
+        out.append(rec)
+    return out
+
+
+def busy_state(rec, cfg):
+    why = []
+    now = time.time()
+    files = [rec.get('transcript')] + rec.get('extra_files', [])
+    if rec['kind'] == 'claude' and rec.get('transcript'):
+        files += glob.glob(rec['transcript'][:-6] + '/subagents/*.jsonl')
+    if any(f and os.path.exists(f) and now - os.path.getmtime(f) < cfg['busy_window_seconds'] for f in files):
+        why.append('transcript written recently')
+    for c in descendants(rec['pid']):
+        a = read(f'/proc/{c}/cmdline', 'rb').replace(b'\0', b' ').decode(errors='replace')
+        if re.match(r'(/\S*/)?(ba|z)?sh -l?c ', a) or 'shell-snapshots' in a or ' exec ' in a:
+            why.append('child shell/job running')
+            break
+    return bool(why), why
+
+
+def relaunch_command(rec, cfg):
+    for rule in cfg.get('rules', []):
+        m = rule.get('match', {})
+        if m.get('kind') and m['kind'] != rec['kind']:
+            continue
+        if m.get('cwd') and not re.search(m['cwd'], rec['cwd']):
+            continue
+        env = environ(rec['pid']) if 'pid' in rec else {}
+        if any(os.path.expanduser(str(v)) != env.get(k) for k, v in m.get('env', {}).items()):
+            continue
+        return rule['command'].replace('{id}', rec['session_id'])
+    envs = ' '.join(f'{k}={shlex.quote(v)}' for k, v in sorted(rec['env'].items()))
+    exe = 'command ' + shlex.quote(rec['argv0'])  # `command` skips shell functions that wrap/guard the binary
+    sub = f'--resume {rec["session_id"]}' if rec['kind'] == 'claude' else f'resume {rec["session_id"]}'
+    args = ' '.join(shlex.quote(a) for a in rec['args'])
+    prefix = f'env {envs} ' if envs else ''
+    return f'{prefix}{exe} {args} {sub}'.replace('  ', ' ').strip()
+
+# ----------------------------------------------------------------------------- tabs <-> sessions
+
+
+def read_tabs(read_text):
+    ps1 = os.path.join(STATE, 'uia.ps1')
+    with open(ps1, 'w', encoding='utf-8-sig') as f:
+        f.write(UIA_PS1)
+    out = os.path.join(STATE, 'tabs.json')
+    if os.path.exists(out):
+        os.remove(out)
+    args = ['-Out', winpath(out)] + (['-ReadText'] if read_text else [])
+    powershell_file(ps1, *args)
+    if not os.path.exists(out):
+        die('could not read Windows Terminal tabs via UI Automation (is Windows Terminal running?)')
+    tabs = json.load(open(out, encoding='utf-8-sig'))
+    return tabs if isinstance(tabs, list) else [tabs]
+
+
+CODEX_MARK = re.compile(r'Ask Codex|OpenAI Codex|codex resume|› ', re.M)
+CLAUDE_MARK = re.compile(r'Claude Code|bypass permissions|\? for shortcuts|❯ ', re.M)
+
+
+def score(tab, rec, tails):
+    text = tab.get('text') or ''
+    if not text.strip():
+        return 0
+    if rec['kind'] == 'codex' and CLAUDE_MARK.search(text) and not CODEX_MARK.search(text):
+        return -5
+    if rec['kind'] == 'claude' and CODEX_MARK.search(text) and not CLAUDE_MARK.search(text):
+        return -5
+    tail = tails[rec['session_id']]
+    s = 0
+    for line in text.splitlines():
+        for piece in re.split(r'\s{2,}|[│┃|]', line):
+            piece = piece.strip(' ─━•›❯●⎿▎└├')
+            if len(piece) >= 8 and piece in tail:
+                s += 1
+    base = os.path.basename(rec['cwd'].rstrip('/'))
+    if base and re.search(r'[\[ /…]' + re.escape(base) + r'[\] ]', text):
+        s += 3
+    return s
+
+
+def assign(tabs, recs):
+    """Match WT sessions to tabs. Tabs keep creation order unless dragged, so prefer the monotone alignment
+    (sessions sorted by creation -> tabs in strip order) that maximises content score; fall back to greedy
+    matching when that is clearly better (tabs were dragged, several windows)."""
+    tails = {r['session_id']: tail_text(r.get('transcript')) for r in recs}
+    S = [[score(t, r, tails) for t in tabs] for r in recs]
+    n, m = len(recs), len(tabs)
+    # monotone DP: best[i][j] = best score placing first i sessions into first j tabs
+    NEG = float('-inf')
+    best = [[NEG] * (m + 1) for _ in range(n + 1)]
+    take = [[False] * (m + 1) for _ in range(n + 1)]
+    for j in range(m + 1):
+        best[0][j] = 0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            skip = best[i][j - 1]
+            use = best[i - 1][j - 1] + S[i - 1][j - 1] + 0.5 if best[i - 1][j - 1] > NEG else NEG
+            best[i][j], take[i][j] = (use, True) if use >= skip else (skip, False)
+    mono = {}
+    if n <= m and best[n][m] > NEG:
+        i, j = n, m
+        while i > 0:
+            if take[i][j]:
+                mono[i - 1] = j - 1
+                i -= 1
+            j -= 1
+    greedy, used = {}, set()
+    for sc, ri, ti in sorted(((S[ri][ti], ri, ti) for ri in range(n) for ti in range(m)), reverse=True):
+        if ri in greedy or ti in used or sc <= 0:
+            continue
+        greedy[ri] = ti
+        used.add(ti)
+    total = lambda a: sum(S[r][t] for r, t in a.items())
+    if len(mono) == n and total(mono) + 5 >= total(greedy) * 0.8:
+        chosen, how = mono, 'creation order + content'
+    else:
+        chosen, how = greedy, 'content only'
+    return chosen, how, S
+
+# ----------------------------------------------------------------------------- snapshot / plan
+
+
+def looks_hand_set(title, profile, cfg):
+    if cfg['titles'] == 'never' or not title or title == profile:
+        return False
+    if cfg['titles'] == 'always':
+        return True
+    # app/shell generated titles: user@host:dir, paths, spinners, agent status titles
+    return not re.search(r'^\S+@\S+[: ]|^[~/]|^[✳✶✻✽·✢⠐-⣿]|Claude Code|^codex', title)
+
+
+def wt_profile(cfg, distro):
+    if cfg.get('profile'):
+        return cfg['profile']
+    for p in glob.glob(os.path.join(winenv('LOCALAPPDATA'), 'Packages', 'Microsoft.WindowsTerminal*', 'LocalState', 'settings.json')):
+        try:
+            txt = re.sub(r'^\s*//.*$', '', open(p, encoding='utf-8-sig').read(), flags=re.M)
+            for pr in json.loads(txt).get('profiles', {}).get('list', []):
+                if pr.get('source') == 'Microsoft.WSL' and pr.get('name') == distro and not pr.get('hidden'):
+                    return pr['name']
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def take_snapshot(cfg, read_text=True, self_pid=None):
+    os.makedirs(STATE, exist_ok=True)
+    distro = os.environ.get('WSL_DISTRO_NAME') or die('not running inside WSL')
+    recs = find_sessions(cfg)
+    wt_recs = sorted([r for r in recs if r['container'] == 'wt'], key=lambda r: r['order'])
+    tabs = read_tabs(read_text and bool(wt_recs))
+    chosen, how, S = assign(tabs, wt_recs) if wt_recs else ({}, '-', [])
+    if self_pid is None:
+        self_pid = next((a for a in ancestors(os.getpid()) if any(r['pid'] == a for r in recs)), None)
+    profile = wt_profile(cfg, distro)
+    by_tab = {ti: wt_recs[ri] for ri, ti in chosen.items()}
+    windows = {}
+    for ti, t in enumerate(tabs):
+        r = by_tab.get(ti)
+        windows.setdefault(t['window'], dict(state=t['state'], x=t['x'], y=t['y'], w=t['w'], h=t['h'], tabs=[]))
+        entry = dict(index=t['index'], title=t['title'], pin_title=looks_hand_set(t['title'], profile, cfg),
+                     selected=t['selected'])
+        if r:
+            entry['session'] = public(r)
+            entry['session']['self'] = r['pid'] == self_pid
+            entry['score'] = S[wt_recs.index(r)][ti]
+        windows[t['window']]['tabs'].append(entry)
+    unmatched = [public(r) for ri, r in enumerate(wt_recs) if ri not in chosen]
+    tmux = [public(r) | {'self': r['pid'] == self_pid} for r in recs if r['container'] == 'tmux']
+    manifest = dict(version=VERSION, taken_at=time.strftime('%Y-%m-%d %H:%M:%S %z'), distro=distro, profile=profile,
+                    mapping=how, windows=[windows[k] for k in sorted(windows)], tmux=tmux, unmatched=unmatched)
+    with open(os.path.join(STATE, 'manifest.json'), 'w') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=1)
+    return manifest
+
+
+def public(r):
+    keep = ('kind', 'session_id', 'cwd', 'command', 'busy', 'busy_why', 'pid', 'tmux', 'transcript')
+    return {k: r[k] for k in keep if k in r}
+
+
+def agent_script(sess, cfg):
+    """Shell snippet sourced by an interactive shell: wait for network, run the agent, retry quick failures."""
+    prompt = ''
+    if sess.get('self') and cfg['self_prompt']:
+        prompt = cfg['self_prompt']
+    elif sess.get('busy') and cfg['continue_prompt']:
+        prompt = cfg['continue_prompt']
+    cmd = sess['command'] + (' ' + shlex.quote(prompt) if prompt else '')
+    url = cfg['network_check'].get(sess['kind'], '')
+    env_prefix = ' '.join(f'{k}={shlex.quote(v)}' for k, v in sorted(_env_of(sess).items()))
+    lines = ['# generated by wt-agent-restore', f'cd {shlex.quote(sess["cwd"])} 2>/dev/null || cd ~']
+    if url and cfg['network_wait_seconds'] > 0:
+        lines += [
+            '_war_wait() {',
+            '  command -v curl >/dev/null 2>&1 || return 0',
+            f'  _war_end=$(( $(date +%s) + {int(cfg["network_wait_seconds"])} ))',
+            f'  until env {env_prefix} curl -s -m 4 -o /dev/null {shlex.quote(url)}; do',
+            '    [ "$(date +%s)" -ge "$_war_end" ] && { echo "[wt-agent-restore] network still down, starting anyway"; return 0; }',
+            '    echo "[wt-agent-restore] waiting for network..."; sleep 3',
+            '  done',
+            '}',
+        ]
+    else:
+        lines.append('_war_wait() { :; }')
+    lines += [
+        '_war_n=0',
+        'while :; do',
+        '  _war_wait',
+        '  _war_t0=$(date +%s)',
+        f'  {cmd}',
+        '  _war_rc=$?',
+        f'  [ $(( $(date +%s) - _war_t0 )) -ge {int(cfg["retry_if_exits_within"])} ] && break',
+        '  _war_n=$((_war_n + 1))',
+        f'  [ "$_war_n" -ge {int(cfg["retries"])} ] && break',
+        '  echo "[wt-agent-restore] agent exited after a few seconds (rc=$_war_rc); retrying in 10s"; sleep 10',
+        'done',
+        'unset -f _war_wait 2>/dev/null; unset _war_n _war_t0 _war_rc _war_end',
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _env_of(sess):
+    m = re.match(r'env ((?:\S+=\S+ )+)', sess['command'])
+    if not m:
+        return {}
+    return dict(kv.split('=', 1) for kv in shlex.split(m.group(1)))
+
+
+def user_shell():
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_shell or '/bin/bash'
+    except (ImportError, KeyError):
+        return '/bin/bash'
+
+
+def launcher(path_inner, cwd):
+    """POSIX sh script run by `wsl.exe -e sh`: start the user's interactive shell, source the agent snippet, stay."""
+    sh_ = user_shell()
+    inner = f'. {shlex.quote(path_inner)}; exec {shlex.quote(sh_)} -i'
+    return ('#!/bin/sh\n# generated by wt-agent-restore\n'
+            f'cd {shlex.quote(cwd)} 2>/dev/null || cd ~\n'
+            f'exec {shlex.quote(sh_)} -ic {shlex.quote(inner)}\n')
+
+
+def wt_escape(s):
+    return s.replace(';', '\\;')
+
+
+def write_plan(manifest, cfg, preview=False):
+    plan = os.path.join(STATE, 'preview' if preview else 'plan')
+    shutil.rmtree(plan, ignore_errors=True)
+    os.makedirs(plan)
+    windows_args = []
+    for wi, w in enumerate(manifest['windows']):
+        segs, sel = [], 0
+        for t in w['tabs']:
+            if t['selected']:
+                sel = t['index']
+            sess = t.get('session')
+            seg = ['new-tab']
+            if manifest['profile']:
+                seg += ['-p', manifest['profile']]
+            if t['pin_title']:
+                seg += ['--title', wt_escape(t['title']), '--suppressApplicationTitle']
+            if sess:
+                stem = os.path.join(plan, f'w{wi}-tab{t["index"]:02d}')
+                if preview:
+                    body = (f'printf "\\n  tab {t["index"]}  [{t["title"]}]  {sess["kind"]}\\n  cd %s\\n  %s\\n\\n" '
+                            f'{shlex.quote(sess["cwd"])} {shlex.quote(sess["command"])}\n')
+                    if sess.get('busy'):
+                        body += 'echo "  + continue prompt (was busy)"\n'
+                    if sess.get('self'):
+                        body += 'echo "  + verify prompt (ran the reboot)"\n'
+                    body += 'echo; printf "  preview only, nothing was resumed. Press Enter to close. "; read _\n'
+                    open(stem + '.sh', 'w').write('#!/bin/sh\n' + body)
+                else:
+                    open(stem + '.inner', 'w').write(agent_script(sess, cfg))
+                    open(stem + '.sh', 'w').write(launcher(stem + '.inner', sess['cwd']))
+                seg += ['wsl.exe', '-d', manifest['distro'], '-e', 'sh', stem + '.sh']
+            else:
+                if preview:
+                    continue
+                seg += ['wsl.exe', '-d', manifest['distro'], '--cd', '~']  # non-agent tab: plain shell
+            segs.append(seg)
+        if not segs:
+            continue
+        head = ['-w', 'new'] + (['-M'] if w['state'] == 'Maximized' and not preview else
+                                [] if preview else ['--pos', f'{w["x"]},{w["y"]}'])
+        flat = head
+        for k, s in enumerate(segs):
+            flat += ([';'] if k else []) + s
+        flat += [';', 'focus-tab', '-t', str(0 if preview else sel)]
+        windows_args.append(flat)
+    # tmux-hosted sessions
+    tmux_lines = ['#!/bin/sh', '# generated by wt-agent-restore: recreate tmux-hosted agent sessions', 'cd ~']
+    for k, s in enumerate(manifest['tmux']):
+        if preview:
+            break
+        stem = os.path.join(plan, f'tmux{k:02d}')
+        open(stem + '.inner', 'w').write(agent_script(s, cfg))
+        open(stem + '.sh', 'w').write(launcher(stem + '.inner', s['cwd']))
+        t = s['tmux']
+        tmux_lines.append(
+            f'tmux -S {shlex.quote(t["socket"])} has-session -t {shlex.quote(t["name"])} 2>/dev/null || '
+            f'tmux -S {shlex.quote(t["socket"])} new-session -d -s {shlex.quote(t["name"])} -x {t["width"]} -y {t["height"]} '
+            f'-c {shlex.quote(s["cwd"])} "sh {stem}.sh"')
+    open(os.path.join(plan, 'tmux.sh'), 'w').write('\n'.join(tmux_lines) + '\n')
+    return plan, windows_args
+
+
+def restore_ps1(manifest, plan, windows_args, log_name):
+    def psq(s):
+        return "'" + s.replace("'", "''") + "'"
+    arrays = ',\n  '.join('@(' + ', '.join(psq(a) for a in w) + ')' for w in windows_args)
+    has_tmux = bool(manifest['tmux']) and 'preview' not in plan
+    return f'''# generated by wt-agent-restore {VERSION} from the snapshot taken {manifest["taken_at"]}
+$ErrorActionPreference = 'Continue'
+$log = Join-Path $PSScriptRoot '{log_name}'
+"[$(Get-Date -Format s)] restore start" | Out-File -Append -Encoding utf8 $log
+{"Start-Process -WindowStyle Hidden wsl.exe -ArgumentList " + ", ".join(psq(x) for x in ["-d", manifest["distro"], "-e", "sh", plan + "/tmux.sh"]) if has_tmux else "# no tmux sessions"}
+function Q($s) {{ if ($s -match '[\\s"]' -or $s -eq '') {{ '"' + ($s -replace '"', '\\"') + '"' }} else {{ $s }} }}
+$windows = @(
+  {arrays}
+)
+foreach ($w in $windows) {{
+  $line = ($w | ForEach-Object {{ Q $_ }}) -join ' '
+  "wt $line" | Out-File -Append -Encoding utf8 $log
+  Start-Process wt.exe -ArgumentList $line
+  Start-Sleep -Seconds 3
+}}
+"[$(Get-Date -Format s)] done" | Out-File -Append -Encoding utf8 $log
+'''
+
+
+def print_manifest(m):
+    print(f'snapshot {m["taken_at"]}  distro={m["distro"]}  profile={m["profile"]}  mapping={m["mapping"]}')
+    for wi, w in enumerate(m['windows']):
+        print(f'\nwindow {wi} ({w["state"]})')
+        for t in w['tabs']:
+            s = t.get('session')
+            mark = '*' if t['selected'] else ' '
+            title = t['title'] + (' (pinned)' if t['pin_title'] else '')
+            if not s:
+                print(f' {mark}{t["index"]:>2}  {title:<24}  - no agent: reopened as a plain shell')
+                continue
+            flags = ' '.join(x for x in ['BUSY' if s['busy'] else '', 'SELF' if s.get('self') else '',
+                                         'low-confidence' if t.get('score', 0) <= 0 else ''] if x)
+            print(f' {mark}{t["index"]:>2}  {title:<24}  {s["kind"]:<6} {s["session_id"][:8]}  {s["cwd"]}  {flags}')
+            print(f'       $ {s["command"][:160]}')
+    for s in m['tmux']:
+        print(f'\ntmux {s["tmux"]["name"]}: {s["kind"]} {s["session_id"][:8]} {s["cwd"]}  {"BUSY" if s["busy"] else ""}')
+        print(f'       $ {s["command"][:160]}')
+    for s in m['unmatched']:
+        print(f'\n!! could not place {s["kind"]} {s["session_id"][:8]} ({s["cwd"]}) in a tab; it will NOT be restored')
+
+# ----------------------------------------------------------------------------- commands
+
+
+def cmd_snapshot(a, cfg):
+    m = take_snapshot(cfg, read_text=not a.no_screen)
+    print_manifest(m)
+    print(f'\nmanifest: {os.path.join(STATE, "manifest.json")}')
+    return m
+
+
+def cmd_preview(a, cfg):
+    m = take_snapshot(cfg, read_text=not a.no_screen)
+    plan, wargs = write_plan(m, cfg, preview=True)
+    ps1 = os.path.join(windows_dir(), 'preview.ps1')
+    with open(ps1, 'w', encoding='utf-8-sig', newline='\r\n') as f:
+        f.write(restore_ps1(m, plan, wargs, 'preview.log'))
+    powershell_file(ps1)
+    print_manifest(m)
+    print('\nopened a preview window: each tab shows what it would run. Nothing was resumed.')
+
+
+def cmd_arm(a, cfg, self_pid=None):
+    m = take_snapshot(cfg, read_text=not a.no_screen, self_pid=self_pid)
+    plan, wargs = write_plan(m, cfg)
+    wdir = windows_dir()
+    with open(os.path.join(wdir, 'restore.ps1'), 'w', encoding='utf-8-sig', newline='\r\n') as f:
+        f.write(restore_ps1(m, plan, wargs, 'restore.log'))
+    hook = os.path.join(startup_dir(), HOOK_NAME)
+    with open(hook, 'w', newline='\r\n') as f:
+        f.write('@echo off\n'
+                f'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{winpath(os.path.join(wdir, "restore.ps1"))}"\n'
+                'del "%~f0"\n')
+    shutil.copy(os.path.join(STATE, 'manifest.json'), os.path.join(STATE, f'manifest-{time.strftime("%Y%m%d-%H%M%S")}.json'))
+    print_manifest(m)
+    print(f'\narmed: {winpath(hook)} runs once at next logon, then deletes itself.')
+    return m
+
+
+def cmd_disarm(a, cfg):
+    hook = os.path.join(startup_dir(), HOOK_NAME)
+    if os.path.exists(hook):
+        os.remove(hook)
+        print('disarmed.')
+    else:
+        print('not armed.')
+
+
+def cmd_status(a, cfg):
+    hook = os.path.join(startup_dir(), HOOK_NAME)
+    print(f'hook: {"ARMED" if os.path.exists(hook) else "not armed"}  ({winpath(hook)})')
+    mf = os.path.join(STATE, 'manifest.json')
+    if os.path.exists(mf):
+        print_manifest(json.load(open(mf)))
+    log = os.path.join(windows_dir(), 'restore.log')
+    if os.path.exists(log):
+        print('\nlast restore log:\n' + ''.join(open(log, encoding='utf-8-sig', errors='replace').readlines()[-6:]))
+
+
+def windows_cpu(name):
+    r = win(['powershell.exe', '-NoProfile', '-Command',
+             f"(Get-Process -Name '{os.path.splitext(name)[0]}' -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum"])
+    try:
+        return float(r.stdout.strip() or 'nan')
+    except ValueError:
+        return float('nan')
+
+
+def windows_running(name):
+    r = win(['tasklist.exe', '/FI', f'IMAGENAME eq {name}', '/FO', 'CSV', '/NH'])
+    return name.lower() in r.stdout.lower()
+
+
+def wait_for_process(name, stall_minutes, timeout_minutes):
+    print(f'waiting for {name} to exit' + (f' (or to sit idle for {stall_minutes} min)' if stall_minutes else ''), flush=True)
+    start, gone = time.time(), 0
+    last_cpu, last_change, last_cpu_check = None, time.time(), 0
+    while True:
+        if windows_running(name):
+            gone = 0
+        else:
+            gone += 1
+            if gone >= 3:
+                print(f'{name} exited.', flush=True)
+                return 'exited'
+        if stall_minutes and time.time() - last_cpu_check > 60:
+            last_cpu_check = time.time()
+            cpu = windows_cpu(name)
+            if cpu == cpu:  # not NaN
+                if last_cpu is None or abs(cpu - last_cpu) > 0.5:
+                    last_cpu, last_change = cpu, time.time()
+                elif time.time() - last_change > stall_minutes * 60:
+                    print(f'{name} has used no CPU for {stall_minutes} min: treating it as finished/hung.', flush=True)
+                    return 'stalled'
+        if timeout_minutes and time.time() - start > timeout_minutes * 60:
+            print(f'timeout: {name} still running after {timeout_minutes} min.', flush=True)
+            return 'timeout'
+        time.sleep(15)
+
+
+def cmd_reboot(a, cfg):
+    if a.wait_process:
+        r = wait_for_process(a.wait_process, a.stall_minutes, a.timeout_minutes)
+        if r == 'timeout' and not a.reboot_on_timeout:
+            die('not rebooting (use --reboot-on-timeout to reboot anyway)', 2)
+    self_pid = next((p for p in ancestors(os.getpid()) if read(f'/proc/{p}/comm').strip() in ('claude', 'codex')), None)
+    m = cmd_arm(a, cfg, self_pid=self_pid)
+    pids = [t['session']['pid'] for w in m['windows'] for t in w['tabs'] if t.get('session')] + [s['pid'] for s in m['tmux']]
+    if a.dry_run:
+        print(f'\ndry run: would stop pids {pids} and restart Windows in {a.delay}s. The hook stays armed; run `disarm` to undo.')
+        return
+    # The final step kills the agent that may be running us, so hand it to a fully detached process.
+    log = os.path.join(STATE, 'reboot.log')
+    os.makedirs(STATE, exist_ok=True)
+    with open(log, 'a') as lf:
+        subprocess.Popen(['setsid', '-f', sys.executable, os.path.abspath(__file__), '_finish',
+                          '--delay', str(a.delay), '--pids', ','.join(map(str, pids))],
+                         stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, close_fds=True)
+    print(f'\nstopping {len(pids)} agent(s) and restarting Windows in ~{a.delay + 15}s. Log: {log}')
+
+
+def cmd_finish(a, cfg):
+    pids = [int(p) for p in a.pids.split(',') if p]
+    family = set(pids)
+    for p in pids:
+        family.update(descendants(p))
+    print(f'{time.strftime("%F %T")} TERM {sorted(family)}', flush=True)
+    for p in pids:  # agents first so they can flush their transcripts
+        try:
+            os.kill(p, 15)
+        except OSError:
+            pass
+    deadline = time.time() + 15
+    while time.time() < deadline and any(os.path.exists(f'/proc/{p}') for p in pids):
+        time.sleep(0.5)
+    for p in family:
+        try:
+            os.kill(p, 9)
+        except OSError:
+            pass
+    os.sync()
+    r = win(['/mnt/c/Windows/System32/shutdown.exe', '/r', '/t', str(a.delay), '/c',
+             'wt-agent-restore: restarting; your terminal tabs come back after logon'])
+    print(f'{time.strftime("%F %T")} shutdown.exe rc={r.returncode} {r.stderr.strip()}', flush=True)
+
+
+def cmd_verify(a, cfg):
+    mf = os.path.join(STATE, 'manifest.json')
+    if not os.path.exists(mf):
+        die('no snapshot to verify against')
+    m = json.load(open(mf))
+    cfg2 = dict(cfg, busy_window_seconds=0)
+    live = {r['session_id']: r for r in find_sessions(cfg2)}
+    tabs = read_tabs(False)
+    ok = True
+    print(f'verifying against snapshot {m["taken_at"]}')
+    titles = [t['title'] for t in tabs]
+    for wi, w in enumerate(m['windows']):
+        for t in w['tabs']:
+            s = t.get('session')
+            title_ok = (not t['pin_title']) or t['title'] in titles
+            if not s:
+                continue
+            r = live.get(s['session_id'])
+            state = 'running' if r else 'MISSING'
+            ok &= bool(r) and title_ok
+            print(f'  tab {t["index"]:>2} {t["title"]:<20} {s["kind"]:<6} {s["session_id"][:8]}  {state}'
+                  f'{"" if title_ok else "  title MISSING"}')
+    for s in m['tmux']:
+        r = live.get(s['session_id'])
+        ok &= bool(r)
+        print(f'  tmux {s["tmux"]["name"]:<24} {s["kind"]:<6} {s["session_id"][:8]}  {"running" if r else "MISSING"}')
+    if not ok:
+        print('\nsome sessions are missing. A session with no transcript (never used) cannot be resumed; '
+              'otherwise check the tab: the launcher prints why it stopped.')
+    else:
+        print('\nall sessions are back.')
+    sys.exit(0 if ok else 1)
+
+
+def main():
+    p = argparse.ArgumentParser(prog='wt-agent-restore', description=__doc__.split('\n\n')[0])
+    p.add_argument('--version', action='version', version=VERSION)
+    sub = p.add_subparsers(dest='cmd', required=True)
+    for name in ('snapshot', 'preview', 'arm'):
+        s = sub.add_parser(name)
+        s.add_argument('--no-screen', action='store_true', help='do not cycle tabs to read their text (map by creation order only)')
+    sub.add_parser('disarm')
+    sub.add_parser('status')
+    sub.add_parser('verify')
+    r = sub.add_parser('reboot')
+    r.add_argument('--wait-process', metavar='IMAGE', help='Windows image name to wait for first, e.g. setup.exe')
+    r.add_argument('--stall-minutes', type=float, default=0, help='treat the process as done once it used no CPU this long')
+    r.add_argument('--timeout-minutes', type=float, default=0)
+    r.add_argument('--reboot-on-timeout', action='store_true')
+    r.add_argument('--delay', type=int, default=20, help='seconds between shutdown.exe and the restart (cancel: shutdown /a)')
+    r.add_argument('--dry-run', action='store_true')
+    r.add_argument('--no-screen', action='store_true')
+    f = sub.add_parser('_finish')
+    f.add_argument('--delay', type=int, default=20)
+    f.add_argument('--pids', default='')
+    a = p.parse_args()
+    if not os.path.exists('/proc/sys/fs/binfmt_misc/WSLInterop') and not os.environ.get('WSL_DISTRO_NAME'):
+        die('this tool runs inside WSL (it drives Windows Terminal through Windows interop)')
+    cfg = load_config()
+    os.makedirs(STATE, exist_ok=True)
+    {'snapshot': cmd_snapshot, 'preview': cmd_preview, 'arm': cmd_arm, 'disarm': cmd_disarm, 'status': cmd_status,
+     'reboot': cmd_reboot, '_finish': cmd_finish, 'verify': cmd_verify}[a.cmd](a, cfg)
+
+
+if __name__ == '__main__':
+    main()

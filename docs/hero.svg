@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 290" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" role="img" aria-label="Agent tabs before a Windows restart and the same tabs, resumed, after logon">
+<style>
+.bg{fill:#f6f8fa}.win{fill:#fff;stroke:#d0d7de}.bar{fill:#eaeef2}.tab{fill:#fff;stroke:#d0d7de}.sel{fill:#dbeafe;stroke:#3b82f6}
+.t{fill:#24292f;font-size:11px}.m{fill:#57606a;font-size:12px;white-space:pre}.h{fill:#24292f;font-size:14px;font-weight:700;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+.ok{fill:#1a7f37;font-size:12px}.busy{fill:#bf5b04;font-size:12px}.arrow{stroke:#57606a;stroke-width:2;fill:none}.ln{fill:#d0d7de}
+@media (prefers-color-scheme:dark){.bg{fill:#0d1117}.win,.tab{fill:#161b22;stroke:#30363d}.bar{fill:#21262d}.sel{fill:#1e3a5f;stroke:#58a6ff}
+.t,.h{fill:#e6edf3}.m{fill:#8b949e}.ok{fill:#3fb950}.busy{fill:#f0b429}.arrow{stroke:#8b949e}.ln{fill:#30363d}}
+</style>
+<rect class="bg" width="880" height="290" rx="12"/>
+<text class="h" x="30" y="36">Before: "Restart required"</text>
+<text class="h" x="500" y="36">After logon: same window, same sessions</text>
+<rect class="win" x="30" y="52" width="350" height="216" rx="8"/>
+<rect class="bar" x="31" y="53" width="348" height="30" rx="7"/>
+<rect class="tab" x="38" y="58" width="62" height="22" rx="4"/><text class="t" x="46" y="73">api</text>
+<rect class="tab" x="104" y="58" width="62" height="22" rx="4"/><text class="t" x="112" y="73">paper</text>
+<rect class="sel" x="170" y="58" width="62" height="22" rx="4"/><text class="t" x="178" y="73">infra</text>
+<rect class="tab" x="236" y="58" width="62" height="22" rx="4"/><text class="t" x="244" y="73">news</text>
+<rect class="tab" x="302" y="58" width="70" height="22" rx="4"/><text class="t" x="310" y="73">+5 more</text>
+<text class="m" x="46" y="108">claude ~/api</text><text class="ok" x="280" y="108">idle</text>
+<text class="m" x="46" y="132">codex  ~/paper</text><text class="ok" x="280" y="132">idle</text>
+<text class="m" x="46" y="156">claude ~/infra</text><text class="busy" x="280" y="156">working</text>
+<text class="m" x="46" y="180">codex  ~/news</text><text class="ok" x="280" y="180">idle</text>
+<text class="m" x="46" y="204">claude ~/site</text><text class="busy" x="280" y="204">working</text>
+<rect class="ln" x="46" y="222" width="318" height="1"/><text class="m" x="46" y="246">+ 2 agents in tmux</text>
+<path class="arrow" d="M392 160h86m-10-7 10 7-10 7"/><text class="m" x="404" y="148">reboot</text>
+<rect class="win" x="500" y="52" width="350" height="216" rx="8"/>
+<rect class="bar" x="501" y="53" width="348" height="30" rx="7"/>
+<rect class="tab" x="508" y="58" width="62" height="22" rx="4"/><text class="t" x="516" y="73">api</text>
+<rect class="tab" x="574" y="58" width="62" height="22" rx="4"/><text class="t" x="582" y="73">paper</text>
+<rect class="sel" x="640" y="58" width="62" height="22" rx="4"/><text class="t" x="648" y="73">infra</text>
+<rect class="tab" x="706" y="58" width="62" height="22" rx="4"/><text class="t" x="714" y="73">news</text>
+<rect class="tab" x="772" y="58" width="70" height="22" rx="4"/><text class="t" x="780" y="73">+5 more</text>
+<text class="m" x="516" y="108">claude ~/api</text><text class="ok" x="750" y="108">resumed</text>
+<text class="m" x="516" y="132">codex  ~/paper</text><text class="ok" x="750" y="132">resumed</text>
+<text class="m" x="516" y="156">claude ~/infra</text><text class="ok" x="750" y="156">continuing</text>
+<text class="m" x="516" y="180">codex  ~/news</text><text class="ok" x="750" y="180">resumed</text>
+<text class="m" x="516" y="204">claude ~/site</text><text class="ok" x="750" y="204">continuing</text>
+<rect class="ln" x="516" y="222" width="318" height="1"/><text class="m" x="516" y="246">+ 2 agents in tmux, resumed</text>
+</svg>

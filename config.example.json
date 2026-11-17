@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy to ~/.config/wt-agent-restore/config.json and keep only what you change. Keys starting with _ are ignored.",
+
+  "continue_prompt": "[wt-agent-restore] Windows was just rebooted and this session was stopped in the middle of its work (background shells, subagents and child jobs were killed too). Check how far you got and whether any output is incomplete, then continue the original task.",
+  "self_prompt": "[wt-agent-restore] The reboot is done. Run `wt-agent-restore verify`, check the result, and report back to the user.",
+
+  "_busy_window_seconds": "a session counts as busy (gets continue_prompt) if its transcript was written this recently",
+  "busy_window_seconds": 180,
+
+  "_network_check": "before resuming, wait until this URL answers through the session's own proxy env",
+  "network_check": { "claude": "https://api.anthropic.com", "codex": "https://chatgpt.com" },
+  "network_wait_seconds": 180,
+
+  "_retry": "if the agent exits within this many seconds (boot-time races), wait 10s and run it again",
+  "retry_if_exits_within": 30,
+  "retries": 3,
+
+  "_titles": "auto = pin titles that look hand-set; always = pin every non-default title; never",
+  "titles": "auto",
+
+  "_profile": "Windows Terminal profile for restored tabs; null = the profile named after your WSL distro",
+  "profile": null,
+
+  "_rules": "first match wins; {id} is replaced with the session id. match keys: kind, cwd (regex), env (exact, ~ expanded)",
+  "rules": [
+    { "match": { "kind": "claude", "env": { "CLAUDE_CONFIG_DIR": "~/.claude-work" } }, "command": "claude-work --resume {id}" },
+    { "match": { "kind": "codex" }, "command": "codex resume {id}" }
+  ]
+}
