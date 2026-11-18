@@ -1,14 +1,20 @@
 <div align="center">
 
-# wt-agent-restore
+# anti-thanos
 
-**Reboot Windows without losing your Claude Code and Codex tabs.**
+**Reboot Windows. Your Claude Code and Codex sessions come back.**
 
 [English](README.md) · [中文](README.zh-CN.md)
 
 <img src="docs/hero.svg" width="880" alt="Agent tabs before a Windows restart, and the same tabs resumed after logon">
 
 </div>
+
+Thanos snaps his fingers and half of all life turns to dust. Windows restarts, and every AI conversation in your terminal turns to dust with it.
+
+anti-thanos records each session before the restart and brings it back after you log in: the same tabs, the same titles, the same conversations. Agents that were mid-task pick up where they stopped. A snap shouldn't make you forget the ones you loved, or the work you did.
+
+> A snap is not the end. Neither is a reboot.
 
 ## The problem
 
@@ -29,7 +35,7 @@ So you postpone the restart for a day, then a week.
 ## The fix
 
 ```bash
-wt-agent-restore reboot
+anti-thanos reboot
 ```
 
 It records every live agent session, stops them cleanly, and restarts Windows. After you log in, it rebuilds the window:
@@ -41,7 +47,7 @@ It records every live agent session, stops them cleanly, and restarts Windows. A
 | **Same launch** | Your original flags and the environment your wrapper set (config dir, proxy, model…). Optional rules map to your own launcher functions |
 | **Interrupted work continues** | Agents that were mid-task get one message: "you were stopped by a reboot, check what finished, then continue" |
 | **Background agents** | Sessions running inside tmux come back in the same tmux session |
-| **The agent that rebooted reports back** | If an agent ran the reboot, it resumes, runs `wt-agent-restore verify`, and tells you what came back |
+| **The agent that rebooted reports back** | If an agent ran the reboot, it resumes, runs `anti-thanos verify`, and tells you what came back |
 
 The hook runs once, at your next logon, and then deletes itself.
 
@@ -50,22 +56,22 @@ The hook runs once, at your next logon, and then deletes itself.
 Run inside WSL. You need Windows Terminal, Python 3.9+, and WSL interop (on by default).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NeoFantom/wt-agent-restore/main/wt-agent-restore -o ~/.local/bin/wt-agent-restore
-chmod +x ~/.local/bin/wt-agent-restore
+curl -fsSL https://raw.githubusercontent.com/NeoFantom/anti-thanos/main/anti-thanos -o ~/.local/bin/anti-thanos
+chmod +x ~/.local/bin/anti-thanos
 
-wt-agent-restore snapshot   # see which tab maps to which session, and the command each will run
-wt-agent-restore preview    # optional: opens a throwaway window that shows the plan per tab
-wt-agent-restore reboot     # snapshot, arm the hook, stop agents, restart in 20s
+anti-thanos snapshot   # see which tab maps to which session, and the command each will run
+anti-thanos preview    # optional: opens a throwaway window that shows the plan per tab
+anti-thanos reboot     # snapshot, arm the hook, stop agents, restart in 20s
 ```
 
-To cancel during the countdown, run `shutdown /a` in Windows, then `wt-agent-restore disarm`.
+To cancel during the countdown, run `shutdown /a` in Windows, then `anti-thanos disarm`.
 
 ### Wait for an installer, then reboot
 
 This tool exists because of a GPU driver install that froze after it finished. The installer process stayed alive, with no CPU and no disk activity, for an hour and a half:
 
 ```bash
-wt-agent-restore reboot --wait-process setup.exe --stall-minutes 20
+anti-thanos reboot --wait-process setup.exe --stall-minutes 20
 ```
 
 It waits until `setup.exe` exits, or until it has used no CPU for 20 minutes. Then it reboots.
@@ -74,7 +80,7 @@ It waits until `setup.exe` exits, or until it has used no CPU for 20 minutes. Th
 
 Paste this into the Claude Code or Codex session you are already in:
 
-> Windows needs a restart. Use `wt-agent-restore` (https://github.com/NeoFantom/wt-agent-restore): run `wt-agent-restore snapshot` and show me the table first. If every session is mapped, run `wt-agent-restore reboot`. After the reboot you'll be resumed. Run `wt-agent-restore verify` and report.
+> Windows needs a restart. Use `anti-thanos` (https://github.com/NeoFantom/anti-thanos): run `anti-thanos snapshot` and show me the table first. If every session is mapped, run `anti-thanos reboot`. After the reboot you'll be resumed. Run `anti-thanos verify` and report.
 
 ## Commands
 
@@ -100,7 +106,7 @@ Use `--no-screen` to skip reading tab contents. Mapping then relies on creation 
 
 ## Configuration (optional)
 
-Most people need none. If you start agents through shell functions, e.g. one per account, map sessions back to them. Put this in `~/.config/wt-agent-restore/config.json`:
+Most people need none. If you start agents through shell functions, e.g. one per account, map sessions back to them. Put this in `~/.config/anti-thanos/config.json`:
 
 ```json
 {

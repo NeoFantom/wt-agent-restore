@@ -1,14 +1,20 @@
 <div align="center">
 
-# wt-agent-restore
+# anti-thanos
 
-**重启 Windows，你的 Claude Code / Codex 标签页原样回来。**
+**反灭霸：重启 Windows，你的 Claude Code / Codex 对话原样回来。**
 
 [English](README.md) · [中文](README.zh-CN.md)
 
 <img src="docs/hero.svg" width="880" alt="重启前的 agent 标签页，与登录后原样恢复的同一组标签页">
 
 </div>
+
+灭霸打一个响指，一半的生命灰飞烟灭。Windows 重启一次，你终端里所有的 AI 对话也灰飞烟灭。
+
+anti-thanos 在重启前记下每一个对话，在你登录后把它们原样带回来：同样的标签页、同样的标题、同样的对话，干到一半的 agent 接着干。一次响指，不该让你忘记自己爱过的人和做过的工作。
+
+> 响指不是毁灭，重启也不能是。
 
 ## 痛点
 
@@ -29,7 +35,7 @@ Windows 提示：**需要重启**。可能是显卡驱动、系统更新，或�
 ## 解决
 
 ```bash
-wt-agent-restore reboot
+anti-thanos reboot
 ```
 
 它记下所有活着的 agent 会话，体面地停掉它们，然后重启 Windows。你登录后，它把窗口重建出来：
@@ -41,7 +47,7 @@ wt-agent-restore reboot
 | **启动方式一样** | 用原来的参数和 wrapper 设的环境变量（配置目录、代理、模型等）；也可以按规则映射到你自己的启动函数 |
 | **被打断的继续干** | 重启时正在干活的 agent 会收到一句话：「你被重启打断了，先核对完成到哪一步，再继续」 |
 | **后台 agent** | 跑在 tmux 里的会话，恢复到同名 tmux 会话 |
-| **执行重启的 agent 自己汇报** | 如果是某个 agent 执行的重启，它恢复后会运行 `wt-agent-restore verify`，告诉你恢复了哪些 |
+| **执行重启的 agent 自己汇报** | 如果是某个 agent 执行的重启，它恢复后会运行 `anti-thanos verify`，告诉你恢复了哪些 |
 
 开机钩子只在下次登录时运行一次，然后自删。
 
@@ -50,22 +56,22 @@ wt-agent-restore reboot
 在 WSL 里运行。需要 Windows Terminal、Python 3.9+，以及 WSL interop（默认开启）。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NeoFantom/wt-agent-restore/main/wt-agent-restore -o ~/.local/bin/wt-agent-restore
-chmod +x ~/.local/bin/wt-agent-restore
+curl -fsSL https://raw.githubusercontent.com/NeoFantom/anti-thanos/main/anti-thanos -o ~/.local/bin/anti-thanos
+chmod +x ~/.local/bin/anti-thanos
 
-wt-agent-restore snapshot   # 看每个标签页对应哪个会话、各自将运行什么命令
-wt-agent-restore preview    # 可选：开一个临时窗口，逐个标签页展示计划
-wt-agent-restore reboot     # 快照 → 装钩子 → 停 agent → 20 秒后重启
+anti-thanos snapshot   # 看每个标签页对应哪个会话、各自将运行什么命令
+anti-thanos preview    # 可选：开一个临时窗口，逐个标签页展示计划
+anti-thanos reboot     # 快照 → 装钩子 → 停 agent → 20 秒后重启
 ```
 
-倒计时内想取消：在 Windows 里运行 `shutdown /a`，再运行 `wt-agent-restore disarm`。
+倒计时内想取消：在 Windows 里运行 `shutdown /a`，再运行 `anti-thanos disarm`。
 
 ### 等安装程序结束再重启
 
 这个工具就是这么来的：显卡驱动装完后安装程序卡住了，进程一直不退出，一个半小时里 CPU 和磁盘都没动静。
 
 ```bash
-wt-agent-restore reboot --wait-process setup.exe --stall-minutes 20
+anti-thanos reboot --wait-process setup.exe --stall-minutes 20
 ```
 
 等到 `setup.exe` 退出，或者它连续 20 分钟没用 CPU，就重启。
@@ -74,7 +80,7 @@ wt-agent-restore reboot --wait-process setup.exe --stall-minutes 20
 
 把这段话贴进你正在用的 Claude Code / Codex 会话：
 
-> Windows 需要重启。用 `wt-agent-restore`（https://github.com/NeoFantom/wt-agent-restore）：先运行 `wt-agent-restore snapshot` 给我看对应表。如果每个会话都对上了，就运行 `wt-agent-restore reboot`。重启后你会被恢复，届时运行 `wt-agent-restore verify` 并向我汇报。
+> Windows 需要重启。用 `anti-thanos`（https://github.com/NeoFantom/anti-thanos）：先运行 `anti-thanos snapshot` 给我看对应表。如果每个会话都对上了，就运行 `anti-thanos reboot`。重启后你会被恢复，届时运行 `anti-thanos verify` 并向我汇报。
 
 ## 命令
 
@@ -100,7 +106,7 @@ wt-agent-restore reboot --wait-process setup.exe --stall-minutes 20
 
 ## 配置（可选）
 
-大多数人不需要配置。如果你用 shell 函数启动 agent（比如一个账号一个函数），可以把会话映射回这些函数。写在 `~/.config/wt-agent-restore/config.json`：
+大多数人不需要配置。如果你用 shell 函数启动 agent（比如一个账号一个函数），可以把会话映射回这些函数。写在 `~/.config/anti-thanos/config.json`：
 
 ```json
 {

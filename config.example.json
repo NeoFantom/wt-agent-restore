@@ -1,8 +1,8 @@
 {
-  "_comment": "Copy to ~/.config/wt-agent-restore/config.json and keep only what you change. Keys starting with _ are ignored.",
+  "_comment": "Copy to ~/.config/anti-thanos/config.json and keep only what you change. Keys starting with _ are ignored.",
 
-  "continue_prompt": "[wt-agent-restore] Windows was just rebooted and this session was stopped in the middle of its work (background shells, subagents and child jobs were killed too). Check how far you got and whether any output is incomplete, then continue the original task.",
-  "self_prompt": "[wt-agent-restore] The reboot is done. Run `wt-agent-restore verify`, check the result, and report back to the user.",
+  "continue_prompt": "[anti-thanos] Windows was just rebooted and this session was stopped in the middle of its work (background shells, subagents and child jobs were killed too). Check how far you got and whether any output is incomplete, then continue the original task.",
+  "self_prompt": "[anti-thanos] The reboot is done. Run `anti-thanos verify`, check the result, and report back to the user.",
 
   "_busy_window_seconds": "a session counts as busy (gets continue_prompt) if its transcript was written this recently",
   "busy_window_seconds": 180,

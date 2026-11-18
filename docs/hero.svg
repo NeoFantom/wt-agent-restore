@@ -7,8 +7,8 @@
 .t,.h{fill:#e6edf3}.m{fill:#8b949e}.ok{fill:#3fb950}.busy{fill:#f0b429}.arrow{stroke:#8b949e}.ln{fill:#30363d}}
 </style>
 <rect class="bg" width="880" height="290" rx="12"/>
-<text class="h" x="30" y="36">Before: "Restart required"</text>
-<text class="h" x="500" y="36">After logon: same window, same sessions</text>
+<text class="h" x="30" y="36">Before the snap: "Restart required"</text>
+<text class="h" x="500" y="36">After logon: every session is back</text>
 <rect class="win" x="30" y="52" width="350" height="216" rx="8"/>
 <rect class="bar" x="31" y="53" width="348" height="30" rx="7"/>
 <rect class="tab" x="38" y="58" width="62" height="22" rx="4"/><text class="t" x="46" y="73">api</text>
